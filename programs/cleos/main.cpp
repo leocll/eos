@@ -119,7 +119,7 @@ Options:
 #include <Runtime/Runtime.h>
 
 #include <fc/io/fstream.hpp>
-
+#include <fc/io/json.hpp>
 #include "CLI11.hpp"
 #include "help_text.hpp"
 #include "localize.hpp"
@@ -134,6 +134,7 @@ using namespace eosio::client::help;
 using namespace eosio::client::http;
 using namespace eosio::client::localize;
 using namespace eosio::client::config;
+using namespace eosio::client::print_out;
 using namespace boost::filesystem;
 
 FC_DECLARE_EXCEPTION( explained_exception, 9000000, "explained exception, see error log" );
@@ -182,6 +183,7 @@ bool   tx_print_json = false;
 bool   print_request = false;
 bool   print_response = false;
 bool   no_auto_keosd = false;
+out_result_object out_object = out_result_object();
 
 uint8_t  tx_max_cpu_usage = 0;
 uint32_t tx_max_net_usage = 0;
@@ -346,7 +348,7 @@ fc::variant push_actions(std::vector<chain::action>&& actions, int32_t extra_kcp
    return push_transaction(trx, extra_kcpu, compression);
 }
 
-void print_action( const fc::variant& at ) {
+fc::mutable_variant_object print_action( const fc::variant& at ) {
    const auto& receipt = at["receipt"];
    auto receiver = receipt["receiver"].as_string();
    const auto& act = at["act"].get_object();
@@ -363,12 +365,18 @@ void print_action( const fc::variant& at ) {
    */
    if( args.size() > 100 ) args = args.substr(0,100) + "...";
    cout << "#" << std::setw(14) << right << receiver << " <= " << std::setw(28) << std::left << (code +"::" + func) << " " << args << "\n";
+
+   fc::mutable_variant_object action_variant_obj = fc::mutable_variant_object("receiver", receiver)("code", code)("action", func)("args", args);
+
    if( console.size() ) {
       std::stringstream ss(console);
       string line;
       std::getline( ss, line );
       cout << ">> " << line << "\n";
+
+      action_variant_obj("console", line);
    }
+    return action_variant_obj;
 }
 
 //resolver for ABI serializer to decode actions in proposed transaction in multisig contract
@@ -431,12 +439,17 @@ bytes json_or_file_to_bin( const account_name& account, const action_name& actio
    return variant_to_bin( account, action, action_args_var );
 }
 
-void print_action_tree( const fc::variant& action ) {
-   print_action( action );
+fc::mutable_variant_object print_action_tree( const fc::variant& action ) {
+   fc::mutable_variant_object action_tree = print_action( action );
+   std::vector<fc::mutable_variant_object> action_inline_traces;
+
    const auto& inline_traces = action["inline_traces"].get_array();
    for( const auto& t : inline_traces ) {
-      print_action_tree( t );
+      fc::mutable_variant_object action_sub_inline_traces = print_action_tree( t );
+      action_inline_traces.push_back(action_sub_inline_traces);
    }
+   if (action_inline_traces.size() > 0) action_tree("inline_traces", action_inline_traces);
+   return action_tree;
 }
 
 void print_result( const fc::variant& result ) { try {
@@ -469,6 +482,8 @@ void print_result( const fc::variant& result ) { try {
 
          cerr << " us\n";
 
+         out_object.set_transaction(transaction_id, net<0?"<unknown>":fc::variant(net).as_string(), cpu<0?"<unknown>":fc::variant(cpu).as_string());
+
          if( status == "failed" ) {
             auto soft_except = processed["except"].as<optional<fc::exception>>();
             if( soft_except ) {
@@ -477,7 +492,7 @@ void print_result( const fc::variant& result ) { try {
          } else {
             const auto& actions = processed["action_traces"].get_array();
             for( const auto& a : actions ) {
-               print_action_tree( a );
+               out_object.add_action_tree(print_action_tree( a ));
             }
             wlog( "\rwarning: transaction executed locally, but may not be confirmed by the network yet" );
          }
@@ -1477,6 +1492,8 @@ void get_account( const string& accountName, const string& coresym, bool json_fo
       json = call(get_account_func, fc::mutable_variant_object("account_name", accountName)("expected_core_symbol", symbol::from_string(coresym)));
    }
 
+   out_object.set_info("account_info", json);
+
    auto res = json.as<eosio::chain_apis::read_only::get_account_results>();
    if (!json_format) {
       asset staked;
@@ -1787,8 +1804,9 @@ int main( int argc, char** argv ) {
    // create key
    auto create_key = create->add_subcommand("key", localized("Create a new keypair and print the public and private keys"))->set_callback( [&r1, &key_file, &print_console](){
       if (key_file.empty() && !print_console) {
-         std::cerr << "ERROR: Either indicate a file using \"--file\" or pass \"--to-console\"" << std::endl;
-         return;
+//         std::cerr << "ERROR: Either indicate a file using \"--file\" or pass \"--to-console\"" << std::endl;
+//         return;
+         print_console = true;
       }
 
       auto pk    = r1 ? private_key_type::generate_r1() : private_key_type::generate();
@@ -1803,6 +1821,8 @@ int main( int argc, char** argv ) {
          out << localized("Private key: ${key}", ("key",  privs) ) << std::endl;
          out << localized("Public key: ${key}", ("key", pubs ) ) << std::endl;
       }
+      out_object.set_info("private_key", privs);
+      out_object.set_info("public_key", pubs);
    });
    create_key->add_flag( "--r1", r1, "Generate a key using the R1 curve (iPhone), instead of the K1 curve (Bitcoin)"  );
    create_key->add_option("-f,--file", key_file, localized("Name of file to write private/public key output to. (Must be set, unless \"--to-console\" is passed"));
@@ -1901,6 +1921,7 @@ int main( int argc, char** argv ) {
    // get info
    get->add_subcommand("info", localized("Get current blockchain information"))->set_callback([] {
       std::cout << fc::json::to_pretty_string(get_info()) << std::endl;
+      out_object.set_info("info", fc::json::to_pretty_string(get_info()));
    });
 
    // get block
@@ -1911,11 +1932,15 @@ int main( int argc, char** argv ) {
    getBlock->add_flag("--header-state", get_bhs, localized("Get block header state from fork database instead") );
    getBlock->set_callback([&blockArg,&get_bhs] {
       auto arg = fc::mutable_variant_object("block_num_or_id", blockArg);
+      string info_ = "";
       if( get_bhs ) {
-         std::cout << fc::json::to_pretty_string(call(get_block_header_state_func, arg)) << std::endl;
+         info_ = fc::json::to_pretty_string(call(get_block_header_state_func, arg));
+         std::cout << info_ << std::endl;
       } else {
-         std::cout << fc::json::to_pretty_string(call(get_block_func, arg)) << std::endl;
+         info_ = fc::json::to_pretty_string(call(get_block_func, arg));
+         std::cout << info_ << std::endl;
       }
+      out_object.set_info("block_info", info_);
    });
 
    // get account
@@ -1938,19 +1963,21 @@ int main( int argc, char** argv ) {
    getCode->add_option("-a,--abi",abiFilename, localized("The name of the file to save the contract .abi to") );
    getCode->add_flag("--wasm", code_as_wasm, localized("Save contract as wasm"));
    getCode->set_callback([&] {
-      string code_hash, wasm, wast, abi;
+      string code_hash, wasm, wasm_hex, wast, abi;
       try {
          const auto result = call(get_raw_code_and_abi_func, fc::mutable_variant_object("account_name", accountName));
          const std::vector<char> wasm_v = result["wasm"].as_blob().data;
          const std::vector<char> abi_v = result["abi"].as_blob().data;
 
          fc::sha256 hash;
-         if(wasm_v.size())
+         if(wasm_v.size()) {
             hash = fc::sha256::hash(wasm_v.data(), wasm_v.size());
+            wasm_hex = fc::to_hex(wasm_v);
+         }
          code_hash = (string)hash;
 
          wasm = string(wasm_v.begin(), wasm_v.end());
-         if(!code_as_wasm && wasm_v.size())
+         if(true/*!code_as_wasm*/ && wasm_v.size())
             wast = wasm_to_wast((const uint8_t*)wasm_v.data(), wasm_v.size(), false);
 
          abi_def abi_d;
@@ -1959,14 +1986,20 @@ int main( int argc, char** argv ) {
       }
       catch(chain::missing_chain_api_plugin_exception&) {
          //see if this is an old nodeos that doesn't support get_raw_code_and_abi
-         const auto old_result = call(get_code_func, fc::mutable_variant_object("account_name", accountName)("code_as_wasm",code_as_wasm));
+         const auto old_result = call(get_code_func, fc::mutable_variant_object("account_name", accountName)("code_as_wasm",false/*code_as_wasm*/));
          code_hash = old_result["code_hash"].as_string();
+         wasm = old_result["wasm"].as_string();
+         wasm_hex = wasm;
+         wast = old_result["wast"].as_string();
+
          if(code_as_wasm) {
-            wasm = old_result["wasm"].as_string();
+            /*wasm = old_result["wasm"].as_string();*/
             std::cout << localized("Warning: communicating to older nodeos which returns malformed binary wasm") << std::endl;
+
+            out_object.add_warning("Warning: communicating to older nodeos which returns malformed binary wasm");
          }
-         else
-            wast = old_result["wast"].as_string();
+         /*else
+            wast = old_result["wast"].as_string();*/
          abi = fc::json::to_pretty_string(old_result["abi"]);
       }
 
@@ -1986,6 +2019,11 @@ int main( int argc, char** argv ) {
          std::ofstream abiout( abiFilename.c_str() );
          abiout << abi;
       }
+
+      out_object.set_info("code_hash", code_hash);
+      out_object.set_info("wasm", wasm_hex);
+      out_object.set_info("wast", wast);
+      out_object.set_info("abi", abi);
    });
 
    // get abi
@@ -1997,6 +2035,7 @@ int main( int argc, char** argv ) {
       auto result = call(get_abi_func, fc::mutable_variant_object("account_name", accountName));
 
       auto abi  = fc::json::to_pretty_string( result["abi"] );
+
       if( filename.size() ) {
          std::cerr << localized("saving abi to ${filename}", ("filename", filename)) << std::endl;
          std::ofstream abiout( filename.c_str() );
@@ -2004,6 +2043,8 @@ int main( int argc, char** argv ) {
       } else {
          std::cout << abi << "\n";
       }
+
+      out_object.set_info("abi", abi);
    });
 
    // get table
@@ -2052,8 +2093,9 @@ int main( int argc, char** argv ) {
                          ("encode_type", encode_type)
                          );
 
-      std::cout << fc::json::to_pretty_string(result)
-                << std::endl;
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("table_data", result);
    });
 
    auto getScope = get->add_subcommand( "scope", localized("Retrieve a list of scopes and tables owned by a contract"), false);
@@ -2069,8 +2111,9 @@ int main( int argc, char** argv ) {
                          ("upper_bound",upper)
                          ("limit",limit)
                          );
-      std::cout << fc::json::to_pretty_string(result)
-                << std::endl;
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("scope_data", result);
    });
 
    // currency accessors
@@ -2090,10 +2133,14 @@ int main( int argc, char** argv ) {
       );
 
       const auto& rows = result.get_array();
-      for( const auto& r : rows ) {
-         std::cout << r.as_string()
-                   << std::endl;
-      }
+      int i = 0;
+        std::vector<std::string> balance_obj;
+       for( const auto& r : rows ) {
+         std::cout << r.as_string() << std::endl;
+         balance_obj.push_back(r.as_string());
+         i++;
+       }
+       out_object.set_info("balance_info", fc::variant(balance_obj));
    });
 
    auto get_currency_stats = get_currency->add_subcommand( "stats", localized("Retrieve the stats of for a given currency"), false);
@@ -2105,8 +2152,9 @@ int main( int argc, char** argv ) {
          ("symbol", symbol)
       );
 
-      std::cout << fc::json::to_pretty_string(result)
-                << std::endl;
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("currency_stats_info", result);
    });
 
    // get accounts
@@ -2119,7 +2167,10 @@ int main( int argc, char** argv ) {
          public_key = public_key_type(public_key_str);
       } EOS_RETHROW_EXCEPTIONS(public_key_type_exception, "Invalid public key: ${public_key}", ("public_key", public_key_str))
       auto arg = fc::mutable_variant_object( "public_key", public_key);
-      std::cout << fc::json::to_pretty_string(call(get_key_accounts_func, arg)) << std::endl;
+      auto result = call(get_key_accounts_func, arg);
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("accounts_info", result);
    });
 
 
@@ -2129,7 +2180,10 @@ int main( int argc, char** argv ) {
    getServants->add_option("account", controllingAccount, localized("The name of the controlling account"))->required();
    getServants->set_callback([&] {
       auto arg = fc::mutable_variant_object( "controlling_account", controllingAccount);
-      std::cout << fc::json::to_pretty_string(call(get_controlled_accounts_func, arg)) << std::endl;
+      auto result = call(get_controlled_accounts_func, arg);
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("servants_info", result);
    });
 
    // get transaction
@@ -2143,7 +2197,10 @@ int main( int argc, char** argv ) {
       if ( block_num_hint > 0 ) {
          arg = arg("block_num_hint", block_num_hint);
       }
-      std::cout << fc::json::to_pretty_string(call(get_transaction_func, arg)) << std::endl;
+      auto result = call(get_transaction_func, arg);
+      std::cout << fc::json::to_pretty_string(result) << std::endl;
+
+      out_object.set_info("transaction_info", result);
    });
 
    // get actions
@@ -2173,6 +2230,7 @@ int main( int argc, char** argv ) {
 
       auto result = call(get_actions_func, arg);
 
+      out_object.set_info("actions_info", result);
 
       if( printjson ) {
          std::cout << fc::json::to_pretty_string(result) << std::endl;
@@ -2389,6 +2447,7 @@ int main( int argc, char** argv ) {
          }
       } else {
          std::cout << "Skipping set code because the new code is the same as the existing code" << std::endl;
+         out_object.add_warning("Skipping set code because the new code is the same as the existing code");
       }
    };
 
@@ -2438,6 +2497,7 @@ int main( int argc, char** argv ) {
          }
       } else {
          std::cout << "Skipping set abi because the new abi is the same as the existing abi" << std::endl;
+         out_object.add_warning("Skipping set abi because the new abi is the same as the existing abi");
       }
    };
 
@@ -2454,6 +2514,7 @@ int main( int argc, char** argv ) {
          send_actions(std::move(actions), 10000, packed_transaction::zlib);
       } else {
          std::cout << "no transaction is sent" << std::endl;
+         out_object.add_warning("no transaction is sent");
       }
    });
    codeSubcommand->set_callback(set_code_callback);
@@ -2556,7 +2617,7 @@ int main( int argc, char** argv ) {
       std::cout << localized("Save password to use in the future to unlock this wallet.") << std::endl;
       std::cout << localized("Without password imported keys will not be retrievable.") << std::endl;
       if (print_console) {
-         std::cout << fc::json::to_pretty_string(v) << std::endl;
+          std::cout << fc::json::to_pretty_string(v) << std::endl;
       } else {
          std::cerr << localized("saving password to ${filename}", ("filename", password_file)) << std::endl;
          auto password_str = fc::json::to_pretty_string(v);
@@ -2564,6 +2625,11 @@ int main( int argc, char** argv ) {
          std::ofstream out( password_file.c_str() );
          out << password_str;
       }
+       auto password_str = fc::json::to_pretty_string(v);
+       boost::replace_all(password_str, "\"", "");
+
+       out_object.set_info("wallet_name", wallet_name);
+       out_object.set_info("password", password_str);
    });
 
    // open wallet
@@ -2626,6 +2692,8 @@ int main( int argc, char** argv ) {
       fc::variants vs = {fc::variant(wallet_name), fc::variant(wallet_key)};
       call(wallet_url, wallet_import_key, vs);
       std::cout << localized("imported private key for: ${pubkey}", ("pubkey", std::string(pubkey))) << std::endl;
+
+      out_object.set_info("public_key", std::string(pubkey));
    });
 
    // remove keys from wallet
@@ -2656,7 +2724,12 @@ int main( int argc, char** argv ) {
       //an empty key type is allowed -- it will let the underlying wallet pick which type it prefers
       fc::variants vs = {fc::variant(wallet_name), fc::variant(wallet_create_key_type)};
       const auto& v = call(wallet_url, wallet_create_key, vs);
-      std::cout << localized("Created new private key with a public key of: ") << fc::json::to_pretty_string(v) << std::endl;
+
+      string public_key = fc::json::to_pretty_string(v);
+      std::cout << localized("Created new private key with a public key of: ") << public_key << std::endl;
+
+      boost::replace_all(public_key, "\"", "");
+      out_object.set_info("public_key", public_key);
    });
 
    // list wallets
@@ -2665,6 +2738,8 @@ int main( int argc, char** argv ) {
       std::cout << localized("Wallets:") << std::endl;
       const auto& v = call(wallet_url, wallet_list);
       std::cout << fc::json::to_pretty_string(v) << std::endl;
+
+      out_object.set_info("wallets", v);
    });
 
    // list keys
@@ -2672,6 +2747,8 @@ int main( int argc, char** argv ) {
    listKeys->set_callback([] {
       const auto& v = call(wallet_url, wallet_public_keys);
       std::cout << fc::json::to_pretty_string(v) << std::endl;
+
+      out_object.set_info("public_keys", v);
    });
 
    // list private keys
@@ -2683,6 +2760,8 @@ int main( int argc, char** argv ) {
       fc::variants vs = {fc::variant(wallet_name), fc::variant(wallet_pw)};
       const auto& v = call(wallet_url, wallet_list_keys, vs);
       std::cout << fc::json::to_pretty_string(v) << std::endl;
+
+      out_object.set_info("keys", v);
    });
 
    auto stopKeosd = wallet->add_subcommand("stop", localized("Stop keosd (doesn't work with nodeos)."), false);
@@ -2756,7 +2835,7 @@ int main( int argc, char** argv ) {
                                  localized("A JSON string or filename defining the action to execute on the contract"), true)->required();
    actionsSubcommand->add_option("data", data, localized("The arguments to the contract"))->required();
 
-   add_standard_transaction_options(actionsSubcommand);
+  add_standard_transaction_options(actionsSubcommand);
    actionsSubcommand->set_callback([&] {
       fc::variant action_args_var;
       if( !data.empty() ) {
@@ -3135,11 +3214,16 @@ int main( int argc, char** argv ) {
    try {
        app.parse(argc, argv);
    } catch (const CLI::ParseError &e) {
-       return app.exit(e);
+       int exit_code = app.exit(e);
+       if (exit_code != 0) {
+          print_parse_error_json(e.what());
+       }
+       return exit_code;
    } catch (const explained_exception& e) {
       return 1;
    } catch (connection_exception& e) {
       if (verbose_errors) {
+         print_parse_error_json(e.to_detail_string());
          elog("connect error: ${e}", ("e", e.to_detail_string()));
       }
       return 1;
@@ -3148,11 +3232,13 @@ int main( int argc, char** argv ) {
       if (!print_recognized_errors(e, verbose_errors)) {
          // Error is not recognized
          if (!print_help_text(e) || verbose_errors) {
+            std::string err_out = verbose_errors ? e.to_detail_string() : e.to_string();
+            print_parse_error_json(err_out);
             elog("Failed with error: ${e}", ("e", verbose_errors ? e.to_detail_string() : e.to_string()));
          }
       }
-      return 1;
+      return 4;
    }
-
+   out_object.print();
    return 0;
 }

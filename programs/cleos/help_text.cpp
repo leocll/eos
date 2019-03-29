@@ -270,6 +270,71 @@ const std::map<int64_t, std::string> error_advice = {
    { wallet_not_available_exception::code_value, error_advice_wallet_not_available_exception }
 };
 
+namespace eosio {
+    namespace client {
+        namespace print_out {
+
+            out_result_object::out_result_object(){}
+
+            void out_result_object::add_warning(std::string warning) {
+                if (!warning.empty()) {
+                    if (!_warning.empty()) {
+                        _warning = _warning + "\n";
+                    }
+                    _warning = _warning + warning;
+                }
+            }
+
+            void out_result_object::set_transaction(std::string transaction_id, std::string net, std::string cpu) {
+                _transaction_obj("transaction_id", transaction_id)("net", net+" bytes")("cpu", cpu+" us");
+            }
+
+            void out_result_object::add_action_tree(fc::mutable_variant_object action_tree) {
+                if (action_tree.size() > 0) {
+                    _action_tree_obj.push_back(action_tree);
+                }
+            }
+
+            out_result_object& out_result_object::set_info( std::string key, fc::variant var ) {
+                _info_obj.set(key, var);
+                return *this;
+            }
+
+            void out_result_object::print() {
+                fc::mutable_variant_object m_variant_obj_ = fc::mutable_variant_object();
+                if (!_warning.empty()) m_variant_obj_("warning", _warning);
+                if (_transaction_obj.size() > 0) m_variant_obj_("transaction", _transaction_obj);
+                if (_action_tree_obj.size() > 0) m_variant_obj_("action_tree", _action_tree_obj);
+                if (_info_obj.size() > 0) m_variant_obj_("info", _info_obj);
+                if (m_variant_obj_.size() > 0) {
+                    print_out_result_json(fc::variant(m_variant_obj_));
+                }
+            }
+
+            void print_out_result_json(const fc::variant& v) {
+                std::string out_str = fc::json::to_string(v);
+                std::cout << "result_json_begin->" << out_str << "<-result_json_end" << std::endl;
+            }
+
+            void print_parse_error_json(std::string description, int64_t code, std::string advice, std::string explanation, std::string stack_trace) {
+
+                if (description.empty())
+                    return;
+                fc::mutable_variant_object error_out = fc::mutable_variant_object();
+                error_out.set("code", code);
+                error_out.set("description", description);
+                if (!advice.empty()) error_out.set("advice", advice);
+                if (!explanation.empty()) error_out.set("explanation", explanation);
+                if (!stack_trace.empty()) error_out.set("stack_trace", stack_trace);
+                std::string error_out_str = fc::json::to_string(fc::variant_object("error", error_out));
+                std::cerr << "error_json_begin->" << error_out_str << "<-error_json_end" << std::endl;
+            }
+        }
+    }
+}
+
+using namespace eosio::client::print_out;
+
 namespace eosio { namespace client { namespace help {
 
 bool print_recognized_errors(const fc::exception& e, const bool verbose_errors) {
@@ -304,6 +369,8 @@ bool print_recognized_errors(const fc::exception& e, const bool verbose_errors) 
       if (!explanation.empty()) explanation = std::string("Error Details:") + explanation;
       if (!stack_trace.empty()) stack_trace = std::string("Stack Trace:") + stack_trace;
 
+      print_parse_error_json(e.what(),e.code(),advice,explanation,stack_trace);
+
       std::cerr << "\033[31m" << "Error " << e.code() << ": " << e.what() << "\033[0m";
       if (!advice.empty()) std::cerr << "\n" << "\033[32m" << advice << "\033[0m";
       if (!explanation.empty()) std::cerr  << "\n" << "\033[33m" << explanation << "\033[0m";
@@ -322,19 +389,23 @@ bool print_help_text(const fc::exception& e) {
    // 2048 nice round number. Picked for no particular reason. Bug above was reported for 22K+ strings.
    if (detail_str.size() > 2048) return result;
    try {
+      std::string outerr = std::string("");
       for (const auto& candidate : error_help_text) {
          auto expr = std::regex {candidate.first};
          std::smatch matches;
          if (std::regex_search(detail_str, matches, expr)) {
             auto args = smatch_to_variant(matches);
             for (const auto& msg: candidate.second) {
+               outerr = outerr + localized_with_variant(msg, args) + "\n";
                std::cerr << localized_with_variant(msg, args) << std::endl;
             }
             result = true;
             break;
          }
       }
+      print_parse_error_json(outerr);
    } catch (const std::regex_error& e ) {
+      print_parse_error_json(e.what(),e.code());
       std::cerr << localized(help_regex_error, ("code", (int64_t)e.code())("what", e.what())) << std::endl;
    }
 
